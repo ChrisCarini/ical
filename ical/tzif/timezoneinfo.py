@@ -145,6 +145,7 @@ class TzInfo(datetime.tzinfo):
         """Initialize TzInfo."""
         self._rule: Rule = rule
         self._key: str | None = key
+        self._dst_year_cache: dict[int, tuple[datetime.datetime, datetime.datetime]] = {}
 
     @classmethod
     def from_timezoneinfo(
@@ -183,9 +184,13 @@ class TzInfo(datetime.tzinfo):
         ):
             return None
 
-        dt_year = datetime.datetime(dt.year, 1, 1)
-        dst_start = next(iter(self._rule.dst_start.as_rrule(dt_year)))
-        dst_end = next(iter(self._rule.dst_end.as_rrule(dt_year)))
+        if (cached := self._dst_year_cache.get(dt.year)) is not None:
+            dst_start, dst_end = cached
+        else:
+            dt_year = datetime.datetime(dt.year, 1, 1)
+            dst_start = next(iter(self._rule.dst_start.as_rrule(dt_year)))
+            dst_end = next(iter(self._rule.dst_end.as_rrule(dt_year)))
+            self._dst_year_cache[dt.year] = (dst_start, dst_end)
         dt_naive = dt.replace(tzinfo=None)
         dst_offset = self._rule.dst.offset - self._rule.std.offset
 
@@ -214,14 +219,33 @@ class TzInfo(datetime.tzinfo):
         return f"TzInfo({self._rule.std.name})"
 
 
-def read_tzinfo(key: str) -> TzInfo:
-    """Create a zoneinfo implementation from raw tzif data."""
-    resolved_key = _resolve_extended_timezone(key)
+@cache
+def _read_tzinfo_resolved(resolved_key: str) -> TzInfo:
+    """Read TzInfo for an already-resolved IANA timezone key.
+
+    Cached separately from ``read_tzinfo`` so the cache lookup is keyed on the
+    resolved IANA name. This avoids creating a fresh ``TzInfo`` instance for
+    every event that references the same timezone, which previously triggered
+    expensive ``utcoffset``/``dst`` recomputation during heap merges and
+    timeline materialization for large calendars.
+    """
     timezoneinfo = _read_cache(resolved_key)
     try:
         return TzInfo.from_timezoneinfo(timezoneinfo, key=resolved_key)
     except ValueError as err:
-        raise TimezoneInfoError(f"Unable create TzInfo: {key}") from err
+        raise TimezoneInfoError(f"Unable create TzInfo: {resolved_key}") from err
+
+
+def read_tzinfo(key: str) -> TzInfo:
+    """Create a zoneinfo implementation from raw tzif data.
+
+    The cache key is the resolved IANA name (after extended-timezone mapping)
+    so behaviour still depends on the current ``is_extended_timezones_enabled``
+    context: a non-IANA key like ``Pacific Standard Time`` continues to raise
+    ``TimezoneInfoError`` when compat mode is off.
+    """
+    resolved_key = _resolve_extended_timezone(key)
+    return _read_tzinfo_resolved(resolved_key)
 
 
 @cache
