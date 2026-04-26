@@ -145,6 +145,14 @@ class TzInfo(datetime.tzinfo):
         """Initialize TzInfo."""
         self._rule: Rule = rule
         self._key: str | None = key
+        # Cache of (dst_start, dst_end) naive datetimes for a given year. The
+        # transition dates depend only on dt.year, but computing them requires
+        # building two dateutil rrules and iterating them which is expensive
+        # when called for every datetime comparison during timeline iteration
+        # of large calendars (e.g. Office 365 ICS feeds).
+        self._dst_transitions_cache: dict[
+            int, tuple[datetime.datetime, datetime.datetime]
+        ] = {}
 
     @classmethod
     def from_timezoneinfo(
@@ -183,9 +191,15 @@ class TzInfo(datetime.tzinfo):
         ):
             return None
 
-        dt_year = datetime.datetime(dt.year, 1, 1)
-        dst_start = next(iter(self._rule.dst_start.as_rrule(dt_year)))
-        dst_end = next(iter(self._rule.dst_end.as_rrule(dt_year)))
+        transitions = self._dst_transitions_cache.get(dt.year)
+        if transitions is None:
+            dt_year = datetime.datetime(dt.year, 1, 1)
+            transitions = (
+                next(iter(self._rule.dst_start.as_rrule(dt_year))),
+                next(iter(self._rule.dst_end.as_rrule(dt_year))),
+            )
+            self._dst_transitions_cache[dt.year] = transitions
+        dst_start, dst_end = transitions
         dt_naive = dt.replace(tzinfo=None)
         dst_offset = self._rule.dst.offset - self._rule.std.offset
 
