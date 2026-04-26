@@ -2,6 +2,7 @@
 
 import datetime
 import random
+import time
 import zoneinfo
 from typing import Any
 from unittest.mock import patch
@@ -9,6 +10,8 @@ from unittest.mock import patch
 import pytest
 
 from ical.calendar import Calendar
+from ical.calendar_stream import IcsCalendarStream
+from ical.compat import enable_compat_mode
 from ical.event import Event
 from ical.journal import Journal
 from ical.types.recur import Recur
@@ -208,6 +211,90 @@ def test_benchmark_materialize_timeline() -> None:
         timeline,
         datetime.date(2022, 1, 1),
         datetime.date(2022, 4, 1),
+    )
+
+
+def _office365_pst_calendar(num_events: int) -> str:
+    """Build a synthetic Office 365 ICS string with N PST-tagged events."""
+    lines = [
+        "BEGIN:VCALENDAR",
+        "METHOD:PUBLISH",
+        "PRODID:Microsoft Exchange Server 2010",
+        "VERSION:2.0",
+        "BEGIN:VTIMEZONE",
+        "TZID:Pacific Standard Time",
+        "BEGIN:STANDARD",
+        "DTSTART:16010101T020000",
+        "TZOFFSETFROM:-0700",
+        "TZOFFSETTO:-0800",
+        "RRULE:FREQ=YEARLY;INTERVAL=1;BYDAY=1SU;BYMONTH=11",
+        "END:STANDARD",
+        "BEGIN:DAYLIGHT",
+        "DTSTART:16010101T020000",
+        "TZOFFSETFROM:-0800",
+        "TZOFFSETTO:-0700",
+        "RRULE:FREQ=YEARLY;INTERVAL=1;BYDAY=2SU;BYMONTH=3",
+        "END:DAYLIGHT",
+        "END:VTIMEZONE",
+    ]
+    base = datetime.datetime(2024, 1, 1, 9, 0)
+    for i in range(num_events):
+        start = base + datetime.timedelta(hours=i)
+        end = start + datetime.timedelta(minutes=30)
+        lines.extend(
+            [
+                "BEGIN:VEVENT",
+                "DTSTAMP:20240101T000000Z",
+                f"UID:event-{i}@example.com",
+                f"DTSTART;TZID=Pacific Standard Time:{start.strftime('%Y%m%dT%H%M%S')}",
+                f"DTEND;TZID=Pacific Standard Time:{end.strftime('%Y%m%dT%H%M%S')}",
+                f"SUMMARY:Event {i}",
+                "END:VEVENT",
+            ]
+        )
+    lines.append("END:VCALENDAR")
+    return "\r\n".join(lines) + "\r\n"
+
+
+def test_materialize_timeline_office365_extended_timezone_perf() -> None:
+    """Regression test for home-assistant/core#148315.
+
+    Materializing a timeline for a large Office 365 calendar where every
+    event references the Windows-style ``TZID=Pacific Standard Time``
+    (mapped via compat mode to ``America/Los_Angeles``) used to take many
+    seconds because each parsed datetime got its own ``TzInfo`` instance,
+    breaking CPython's same-tzinfo comparison fast path and causing every
+    heap-merge comparison to fan out into ``dateutil.rrule`` constructions
+    inside ``TzInfo.dst``. With proper caching this completes in tens of
+    milliseconds.
+    """
+    num_events = 1500
+    ics = _office365_pst_calendar(num_events)
+
+    with enable_compat_mode(ics) as compat_ics:
+        calendar = IcsCalendarStream.calendar_from_ics(compat_ics)
+
+    assert len(calendar.events) == num_events
+
+    now = datetime.datetime.now(tz=datetime.timezone.utc)
+    timeline = calendar.timeline_tz(now.tzinfo)
+
+    start = time.perf_counter()
+    materialized = materialize_timeline(
+        timeline,
+        start=now,
+        stop=now + datetime.timedelta(days=365),
+        max_number_of_events=20,
+    )
+    # Drain the iterator so the heap merge actually runs.
+    list(materialized)
+    elapsed = time.perf_counter() - start
+
+    # On the unfixed code path this takes 10+ seconds even on fast hardware;
+    # the cap is intentionally generous so it does not flake on slow CI.
+    assert elapsed < 1.0, (
+        f"materialize_timeline took {elapsed:.2f}s for {num_events} PST events; "
+        "regression in TzInfo caching"
     )
 
 
